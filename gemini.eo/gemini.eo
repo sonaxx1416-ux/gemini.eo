@@ -1,0 +1,237 @@
+# gemini.eo — كلّم Gemini من eo
+#
+#   import gemini
+#   var conver = gemini.Conversation(env("GEMINI_API_KEY"))
+#   var reply = conver.ask "هلا، مين أنت؟"
+#   print h"Gemini : ${reply}"
+#
+# المفتاح المجاني من https://aistudio.google.com/apikey
+
+const VERSION = "1.0.0"
+const API = "https://generativelanguage.googleapis.com/v1beta"
+
+# الموديلات بالترتيب: لو واحد خلص حده المجاني، ينتقل للي بعده
+const MODELS = ["gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.5-flash"]
+
+# محادثة تتذكر الكلام اللي قبل
+struct Conversation {
+    key @string
+    # تعليمات للموديل: conver.system = "أنت مساعد متجر..."
+    system @string
+    models @list = MODELS
+    temperature @float = 0.7
+    # أقصى طول للرد (0 = خله على الموديل)
+    max_tokens @int = 0
+    # كم رسالة يتذكر (الرسالة = سؤال أو رد)
+    memory @int = 40
+    history @list
+    # آخر خطأ صار ("" لو تمام)
+    error @string
+    # الموديل اللي رد آخر مرة
+    model @string
+    log @bool = true
+    api @string = API
+}
+
+# var reply = conver.ask "سؤال"   → الرد كنص، أو "" لو صار خطأ (والسبب في conver.error)
+func Conversation.ask text {
+    self.error = ""
+    if self.key == "" {
+        return self._fail("no API key. Get one free from https://aistudio.google.com/apikey and pass it: gemini.Conversation(key)")
+    }
+    var question = trim(string(text))
+    if question == "" {
+        return self._fail("the question is empty")
+    }
+    append self.history, {"role": "user", "parts": [{"text": question}]}
+    var reply = self._generate()
+    if reply == none {
+        # السؤال ما انجاوب: نشيله عشان ما يخرب المحادثة
+        self.history = slice(self.history, 0, len(self.history) - 1)
+        return ""
+    }
+    append self.history, {"role": "model", "parts": [{"text": reply}]}
+    self._trim()
+    return reply
+}
+
+# يمسح المحادثة ويبدأ من جديد (التعليمات تبقى)
+func Conversation.clear {
+    self.history = []
+    self.error = ""
+}
+
+# كم رسالة في المحادثة
+func Conversation.count {
+    return len(self.history)
+}
+
+# يحفظ المحادثة في ملف ويرجع لها بعدين: conver.save "chat.json"
+func Conversation.save path @string {
+    save_json path, {"system": self.system, "history": self.history}
+}
+
+# conver.load "chat.json"
+func Conversation.load path @string {
+    var d = load_json(path, none)
+    if d == none {
+        return false
+    }
+    self.system = get(d, "system", self.system)
+    self.history = get(d, "history", [])
+    return true
+}
+
+# المحادثة كنص: "أنت: ...\nGemini: ..."
+func Conversation.transcript {
+    var lines = []
+    for m in self.history {
+        var who = "أنت"
+        if m["role"] == "model" {
+            who = "Gemini"
+        }
+        append lines, who + ": " + m["parts"][0]["text"]
+    }
+    return join(lines, "\n")
+}
+
+# ═════════════════════════════════════════════
+#  سؤال واحد بدون محادثة
+# ═════════════════════════════════════════════
+
+# gemini.ask(key, "سؤال")   أو مع تعليمات: gemini.ask(key, "سؤال", "رد بالإنجليزي")
+func ask key @string, text, system @string = "" {
+    var c = Conversation(key)
+    c.system = system
+    return c.ask(text)
+}
+
+# ═════════════════════════════════════════════
+#  الطلب
+# ═════════════════════════════════════════════
+
+func Conversation._body {
+    var body = {"contents": self.history}
+    if self.system != "" {
+        body["system_instruction"] = {"parts": [{"text": self.system}]}
+    }
+    var cfg = {"temperature": self.temperature}
+    if self.max_tokens > 0 {
+        cfg["maxOutputTokens"] = self.max_tokens
+    }
+    body["generationConfig"] = cfg
+    return body
+}
+
+# يجرب الموديلات بالترتيب. يرجع الرد أو none
+func Conversation._generate {
+    var body = self._body()
+    var last = ""
+    for model in self.models {
+        var tries = 0
+        while tries < 2 {
+            tries += 1
+            var r = http("POST", self.api + "/models/" + model + ":generateContent", body, {"x-goog-api-key": self.key})
+            if r["status"] == 0 {
+                return self._fail_none("can't reach Gemini: " + r["error"])
+            }
+            var d = r["json"]
+            if r["status"] == 200 and d != none {
+                var text = reply_text(d)
+                if text != none {
+                    self.model = model
+                    return text
+                }
+                return self._fail_none(blocked_reason(d))
+            }
+            var msg = error_message(r)
+            last = h"${model}: ${msg}"
+            # المفتاح غلط: ما فيه فايدة نجرب موديل ثاني
+            if r["status"] == 400 and "API key" in msg {
+                return self._fail_none("wrong API key: " + msg)
+            }
+            if r["status"] == 401 or r["status"] == 403 {
+                return self._fail_none("the API key was refused: " + msg)
+            }
+            # 429 (خلص الحد) أو 503 (ضغط): ننتظر شوي ونعيد مرة، بعدها الموديل اللي بعده
+            if (r["status"] == 429 or r["status"] >= 500) and tries < 2 {
+                self._say(h"${model} is busy (${r["status"]}), retrying...")
+                sleep 3
+                continue
+            }
+            break
+        }
+    }
+    return self._fail_none("every model failed. Last: " + last)
+}
+
+func Conversation._fail why @string {
+    self.error = why
+    self._say(why)
+    return ""
+}
+
+func Conversation._fail_none why @string {
+    self._fail(why)
+    return none
+}
+
+func Conversation._say text @string {
+    if self.log {
+        print "[gemini] " + text
+    }
+}
+
+# يخلي المحادثة بالطول المسموح، وتبدأ دايم بسؤال
+func Conversation._trim {
+    if self.memory <= 0 or len(self.history) <= self.memory {
+        return
+    }
+    self.history = slice(self.history, len(self.history) - self.memory)
+    while len(self.history) > 0 and self.history[0]["role"] != "user" {
+        self.history = slice(self.history, 1)
+    }
+}
+
+# النص من رد Gemini (كل الأجزاء)
+func reply_text d {
+    var cands = get(d, "candidates", none)
+    if cands == none or len(cands) == 0 {
+        return none
+    }
+    var content = get(cands[0], "content", none)
+    if content == none {
+        return none
+    }
+    var parts = get(content, "parts", [])
+    var out = ""
+    for p in parts {
+        if has(p, "text") and get(p, "thought", false) != true {
+            out = out + p["text"]
+        }
+    }
+    if out == "" {
+        return none
+    }
+    return trim(out)
+}
+
+func blocked_reason d {
+    var fb = get(d, "promptFeedback", none)
+    if fb != none and has(fb, "blockReason") {
+        return "the question was blocked: " + string(fb["blockReason"])
+    }
+    var cands = get(d, "candidates", [])
+    if len(cands) > 0 and has(cands[0], "finishReason") {
+        return "no answer (" + string(cands[0]["finishReason"]) + ")"
+    }
+    return "empty answer"
+}
+
+func error_message r @map {
+    var d = r["json"]
+    if d != none and has(d, "error") and has(d["error"], "message") {
+        return string(r["status"]) + " " + d["error"]["message"]
+    }
+    return string(r["status"]) + " " + slice(r["body"], 0, 200)
+}

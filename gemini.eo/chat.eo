@@ -1,0 +1,27 @@
+# شات مع Gemini في الطرفية:  eo chat.eo
+# حط مفتاحك في ملف .env جنب الملف:  GEMINI_API_KEY=المفتاح
+import gemini
+
+load_env()
+var conver = gemini.Conversation(env("GEMINI_API_KEY", ""))
+conver.system = "أنت مساعد ودود، ترد بالعربي باختصار."
+
+print "اكتب سؤالك (exit للخروج، clear لمسح المحادثة)"
+while true {
+    var s = trim(input("Enter ask : "))
+    if s == "exit" {
+        break
+    }
+    if s == "clear" {
+        conver.clear
+        print "انمسحت المحادثة"
+        continue
+    }
+    if s == "" {
+        continue
+    }
+    var reply = conver.ask s
+    if reply != "" {
+        print h"Gemini : ${reply}"
+    }
+}
